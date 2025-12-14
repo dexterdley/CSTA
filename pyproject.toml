@@ -63,6 +63,7 @@ train = [
     "lightning",
     "matplotlib",
     "gtts",
+    "h5py",
     "moviepy==1.0.3",
 ]
 
@@ -71,7 +72,7 @@ train = [
 "Bug Tracker" = "https://github.com/haotian-liu/LLaVA/issues"
 
 [tool.setuptools.packages.find]
-include = ["llava*", "trl*", "utils*", "networks*", "qwen-vl-utils*"]
+include = ["llava*", "trl*", "dataloader*", "networks*", "models*"]
 exclude = [
     "assets*",
     "benchmark*",

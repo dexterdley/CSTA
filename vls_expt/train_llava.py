@@ -18,33 +18,14 @@ from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_S
 from llava.conversation import conv_templates
 from llava.model.builder import load_pretrained_model
 from llava.mm_utils import tokenizer_image_token, get_model_name_from_path
-from utils.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, TrainBatchCollator as SumMeTrainCollator, ValBatchCollator as SumMeValCollator
-from utils.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TrainBatchCollator as TVSumTrainCollator, ValBatchCollator as TVSumValCollator
+from dataloader.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, TrainBatchCollator as SumMeTrainCollator, ValBatchCollator as SumMeValCollator
+from dataloader.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TrainBatchCollator as TVSumTrainCollator, ValBatchCollator as TVSumValCollator
 
 # Load configurations
 config = get_config()
 config.model_name = 'LLaVAVLS'
 # Print information of setting
 print_args(config)
-
-# Print the number of parameters
-report_params(
-    model_name=config.model_name,
-    Scale=config.Scale,
-    Softmax_axis=config.Softmax_axis,
-    Balance=config.Balance,
-    Positional_encoding=config.Positional_encoding,
-    Positional_encoding_shape=config.Positional_encoding_shape,
-    Positional_encoding_way=config.Positional_encoding_way,
-    Dropout_on=config.Dropout_on,
-    Dropout_ratio=config.Dropout_ratio,
-    Classifier_on=config.Classifier_on,
-    CLS_on=config.CLS_on,
-    CLS_mix=config.CLS_mix,
-    key_value_emb=config.key_value_emb,
-    Skip_connection=config.Skip_connection,
-    Layernorm=config.Layernorm
-)
 
 custom_system_instruction = (
     "You are an intelligent chatbot designed to critically assess the importance score of each frame within a video context. "
@@ -188,7 +169,7 @@ image_processor = None
 
 if config.model_name == 'LLaVAVLS':
     print("--> Loading LLaVA model...")
-    model_path = getattr(config, 'model_path', "facebook/opt-350m")
+    model_path = getattr(config, 'model_path', "lmms-lab/LLaVA-NeXT-Video-7B-DPO")
     model_base = getattr(config, 'model_base', None)
     model_name = get_model_name_from_path(model_path)
     load_8bit = getattr(config, 'load_8bit', False)
