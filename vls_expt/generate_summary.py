@@ -17,7 +17,7 @@ def generate_summary(all_shot_bound, all_scores, all_nframes, all_positions):
             positions = np.concatenate([positions, [n_frames]])
         for i in range(len(positions) - 1):
             pos_left, pos_right = positions[i], positions[i + 1]
-            if i == len(frame_init_scores):
+            if i >= len(frame_init_scores):
                 frame_scores[pos_left:pos_right] = 0
             else:
                 frame_scores[pos_left:pos_right] = frame_init_scores[i]

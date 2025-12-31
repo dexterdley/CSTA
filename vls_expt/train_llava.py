@@ -3,6 +3,12 @@ import numpy as np
 import shutil
 import torch
 import torch.nn as nn
+import warnings
+import os
+import pytorch_lightning as pl
+from pytorch_lightning import seed_everything
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 from tqdm import tqdm
 
@@ -21,9 +27,13 @@ from llava.mm_utils import tokenizer_image_token, get_model_name_from_path
 from dataloader.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, TrainBatchCollator as SumMeTrainCollator, ValBatchCollator as SumMeValCollator
 from dataloader.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TrainBatchCollator as TVSumTrainCollator, ValBatchCollator as TVSumValCollator
 
+# Suppress warning regarding tensor creation from list of numpy arrays
+warnings.filterwarnings("ignore", message="Creating a tensor from a list of numpy.ndarrays is extremely slow")
+
 # Load configurations
 config = get_config()
 config.model_name = 'LLaVAVLS'
+config.output_name = 'lstm'
 # Print information of setting
 print_args(config)
 
@@ -94,15 +104,18 @@ class LSTMAttnModel(nn.Module):
                     nn.init.constant_(module.bias, 0.0)
 
     def forward(self, x):
+        x = x.unsqueeze(0)
         x, _ = self.lstm(x)
+        x = x.squeeze(0)
         return self.mlp_head(x)
 
-class LLaVAVLS(nn.Module):
-    def __init__(self, config, llava_model, tokenizer):
+class LLaVAVLS_PL(pl.LightningModule):
+    def __init__(self, config, llava_model, tokenizer, dataset_name):
         super().__init__()
         self.config = config
         self.llava_model = llava_model
         self.tokenizer = tokenizer
+        self.dataset_name = dataset_name
 
         # Freeze LLaVA model
         self.llava_model.eval()
@@ -111,9 +124,12 @@ class LLaVAVLS(nn.Module):
 
         # Trainable video summarization model
         if hasattr(self.config, 'output_name') and "lstm" in self.config.output_name:
-            self.attn_model = LSTMAttnModel(self.llava_model.config.hidden_size).to(self.llava_model.device)
+            self.attn_model = LSTMAttnModel(self.llava_model.config.hidden_size)
         else:
-            self.attn_model = AttnModel(self.llava_model.config.hidden_size).to(self.llava_model.device)
+            self.attn_model = AttnModel(self.llava_model.config.hidden_size)
+            
+        self.criterion = nn.MSELoss()
+        self.validation_step_outputs = []
 
     def forward(self, batch):
         question = getattr(self.config, 'prompt', "Please summarize the video.")
@@ -138,7 +154,7 @@ class LLaVAVLS(nn.Module):
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
 
-        input_ids = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(self.llava_model.device)
+        input_ids = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(self.device)
 
         if self.tokenizer.pad_token_id is None:
                 if "qwen" in self.tokenizer.name_or_path.lower():
@@ -147,20 +163,91 @@ class LLaVAVLS(nn.Module):
 
         attention_masks = input_ids.ne(self.tokenizer.pad_token_id).long()
 
-        with torch.no_grad():
-            logits, _, hidden_states = self.llava_model(
-                input_ids=input_ids.repeat(vid_len, 1),
-                attention_mask=attention_masks.repeat(vid_len, 1),
-                images=video,
-                image_sizes=[[item] * getattr(self.config, 'clip_length', 8) for item in video_sizes],
-                modalities=['image'] * vid_len,
-                dpo_forward=True
-            )
+        all_hidden_states = []
+        chunk_size = 32
+        for i in range(0, vid_len, chunk_size):
+            chunk_video = video[i:i+chunk_size]
+            chunk_len = chunk_video.shape[0]
+            chunk_input_ids = input_ids.repeat(chunk_len, 1)
+            chunk_attention_masks = attention_masks.repeat(chunk_len, 1)
 
-        last_hidden_states = hidden_states[:, -1].float()
+            with torch.no_grad():
+                logits, _, hidden_states = self.llava_model(
+                    input_ids=chunk_input_ids,
+                    attention_mask=chunk_attention_masks,
+                    images=chunk_video,
+                    image_sizes=[[item] * getattr(self.config, 'clip_length', 32) for item in video_sizes],
+                    modalities=['image'] * chunk_len,
+                    dpo_forward=True
+                )
+            all_hidden_states.append(hidden_states[:, -1].float().cpu())
+            del logits, hidden_states, chunk_video, chunk_input_ids, chunk_attention_masks
+            torch.cuda.empty_cache()
+
+        last_hidden_states = torch.cat(all_hidden_states, dim=0).to(self.device)
         
         impt_scores = self.attn_model(last_hidden_states)
         return impt_scores
+
+    def training_step(self, batch, batch_idx):
+        if isinstance(batch['gtscore'], list):
+             gtscore = torch.vstack([g.to(self.device) for g in batch['gtscore']])
+        else:
+             gtscore = batch['gtscore']
+             
+        output = self(batch)
+        loss = self.criterion(output, gtscore)
+        self.log('train_loss', loss, batch_size=1, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        output = self(batch)
+        video_name = batch['video_name'][0]
+        self.validation_step_outputs.append({
+            'output': output.detach().cpu(),
+            'video_name': video_name
+        })
+        return None
+
+    def on_validation_epoch_end(self):
+        if not self.validation_step_outputs:
+            return
+            
+        val_spears = []
+        val_kendalls = []
+        user_scores = get_gt(self.dataset_name)
+
+        for item in self.validation_step_outputs:
+            output = item['output']
+            video_num = item['video_name']
+            
+            with h5py.File(f'./data/eccv16_dataset_{self.dataset_name.lower()}_google_pool5.h5','r') as hdf:
+                user_summary = np.array(hdf[video_num]['user_summary'])
+                sb = np.array(hdf[f"{video_num}/change_points"])
+                n_frames = np.array(hdf[f"{video_num}/n_frames"])
+                positions = np.array(hdf[f"{video_num}/picks"])
+            
+            scores = output.squeeze().clone().detach().numpy().tolist()
+            summary = generate_summary([sb], [scores], [n_frames], [positions])[0]
+            
+            if self.dataset_name=='SumMe':
+                spear,kendall = get_corr_coeff([summary],[video_num],self.dataset_name,user_summary)
+            elif self.dataset_name=='TVSum':
+                spear,kendall = get_corr_coeff([scores],[video_num],self.dataset_name,user_scores)
+            
+            val_spears.append(spear)
+            val_kendalls.append(kendall)
+            
+        avg_kendall = np.mean(val_kendalls)
+        avg_spear = np.mean(val_spears)
+        
+        self.log('val_kendall', avg_kendall, sync_dist=True)
+        self.log('val_spearman', avg_spear, sync_dist=True)
+        
+        self.validation_step_outputs.clear()
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=float(self.config.learning_rate), weight_decay=float(self.config.weight_decay))
 
 # Start training
 llava_model = None
@@ -189,7 +276,7 @@ for dataset in tqdm(config.datasets,total=len(config.datasets),ncols=70,leave=Tr
 
     if config.model_name == 'LLaVAVLS':
         def create_llava_splits():
-            for i in range(5):
+            for i in range(1):
                 if dataset == 'SumMe':
                     DatasetCls = SumMeLLaMA_VideoDataset
                     TrainCollator = SumMeTrainCollator
@@ -199,24 +286,71 @@ for dataset in tqdm(config.datasets,total=len(config.datasets),ncols=70,leave=Tr
                     TrainCollator = TVSumTrainCollator
                     ValCollator = TVSumValCollator
                 
-                clip_length = getattr(config, 'clip_length', 8)
+                clip_length = getattr(config, 'clip_length', 32)
                 
                 train_ds = DatasetCls(mode='train', split_idx=i, image_processor=image_processor, clip_length=clip_length, hidden_size=512, load_test=False)
                 test_ds = DatasetCls(mode='test', split_idx=i, image_processor=image_processor, clip_length=clip_length, hidden_size=512, load_test=False)
                 
-                bs = 1 # Force batch size 1 for LLaVA
-
-                train_l = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=4, collate_fn=TrainCollator(), pin_memory=True)
-                test_l = DataLoader(test_ds, batch_size=bs, shuffle=False, num_workers=4, collate_fn=ValCollator(mode="val"), pin_memory=True)
+                train_l = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=4, collate_fn=TrainCollator(), pin_memory=True)
+                test_ds = DatasetCls(mode='test', split_idx=i, image_processor=image_processor, clip_length=clip_length, hidden_size=512, load_test=True)
+                test_l = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=4, collate_fn=ValCollator(mode="val"), pin_memory=True)
                 yield i, (train_l, test_l)
         dataloader_iterator = create_llava_splits()
     else:
         dataloader_iterator = enumerate(create_dataloader(dataset))
 
-    for split_id,(train_loader,test_loader) in tqdm(dataloader_iterator,total=5,ncols=70,leave=False,position=1,desc=dataset):
+    for split_id,(train_loader, test_loader) in tqdm(dataloader_iterator,total=1,ncols=70,leave=False,position=1,desc=dataset):
         if config.model_name == 'LLaVAVLS':
-            model = LLaVAVLS(config, llava_model, tokenizer)
+            model = LLaVAVLS_PL(config, llava_model, tokenizer, dataset)
+            
+            checkpoint_callback = ModelCheckpoint(
+                dirpath=f'./weights/{dataset}/',
+                filename=f'split{split_id+1}',
+                monitor='val_kendall',
+                mode='max',
+                save_top_k=1
+            )
+
+            logger = TensorBoardLogger(save_dir="runs",
+            default_hp_metric=False,
+            name=config.model_name + "_" + config.output_name + "_" + dataset + "_" + str(split_id)
+            )
+
+            logger.experiment.add_text(
+                "hyperparameters",
+                "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(config).items()])),
+            )
+            
+            trainer = pl.Trainer(
+                max_epochs=config.epochs,
+                accelerator='gpu',
+                devices='auto',
+                strategy='ddp',
+                logger=logger,
+                callbacks=[checkpoint_callback],
+                enable_progress_bar=True,
+                log_every_n_steps=1,
+                precision=32,
+                accumulate_grad_batches=batch_size,
+                val_check_interval=1.0
+            )
+            
+            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=test_loader)
+            
+            # Save the trained model weights
+            save_path = f'./weights/{dataset}/split{split_id+1}_attn_model.pth'
+            if checkpoint_callback.best_model_path:
+                print(f"Loading best checkpoint from {checkpoint_callback.best_model_path}")
+                checkpoint = torch.load(checkpoint_callback.best_model_path, map_location='cpu')
+                state_dict = {k.replace('attn_model.', ''): v for k, v in checkpoint['state_dict'].items() if k.startswith('attn_model.')}
+                torch.save(state_dict, save_path)
+                print(f"Saved best model weights to {save_path}")
+            else:
+                torch.save(model.attn_model.state_dict(), save_path)
+                print(f"Saved last model weights to {save_path}")
+            
         else:
+            # Legacy code for other models (not LLaVA)
             model = set_model(
             model_name=config.model_name,
             Scale=config.Scale,
@@ -234,96 +368,3 @@ for dataset in tqdm(config.datasets,total=len(config.datasets),ncols=70,leave=Tr
             Skip_connection=config.Skip_connection,
             Layernorm=config.Layernorm
             )
-        model.to(config.device)
-        criterion = torch.nn.MSELoss()
-        optimizer = torch.optim.Adam(model.parameters(),lr=float(config.learning_rate),weight_decay=float(config.weight_decay))
-
-        model_selection_kendall = -1    
-        model_selection_spear = -1
-
-        for epoch in tqdm(range(config.epochs),total=config.epochs,ncols=70,leave=False,position=2,desc=f'Split{split_id+1}'):
-            model.train()
-            update_loss = 0.0
-            batch = 0
-
-            for batch_data in tqdm(train_loader,ncols=70,leave=False,position=3,desc=f'Epoch{epoch+1}_TRAIN'):
-                if config.model_name == 'LLaVAVLS':
-                    for k, v in batch_data.items():
-                        if isinstance(v, torch.Tensor):
-                            batch_data[k] = v.to(config.device)
-                        elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], torch.Tensor):
-                             batch_data[k] = [x.to(config.device) for x in v]
-                    
-                    output = model(batch_data)
-                    gtscore = torch.vstack(batch_data['gtscore']).to(config.device)
-                    loss = criterion(output, gtscore)
-                else:
-                    feature,gtscore,dataset_name,video_num = batch_data
-                    feature = feature.to(config.device)
-                    gtscore = gtscore.to(config.device)
-                    output = model(feature)
-
-                    loss = criterion(output,gtscore) 
-                
-                loss.requires_grad_(True)
-                
-                update_loss += loss
-                batch += 1
-
-                if batch==batch_size:
-                    optimizer.zero_grad()
-                    update_loss = update_loss / batch
-                    update_loss.backward()
-                    optimizer.step()
-                    update_loss = 0.0
-                    batch = 0
-
-            if batch>0:
-                optimizer.zero_grad()
-                update_loss = update_loss / batch
-                update_loss.backward()
-                optimizer.step()
-                update_loss = 0.0
-                batch = 0
-
-            val_spears = []
-            val_kendalls = []
-            model.eval()
-            with torch.no_grad():
-                for batch_data in tqdm(test_loader,ncols=70,leave=False,position=3,desc=f'Epoch{epoch+1}_TEST'):
-                    if config.model_name == 'LLaVAVLS':
-                        for k, v in batch_data.items():
-                            if isinstance(v, torch.Tensor):
-                                batch_data[k] = v.to(config.device)
-                            elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], torch.Tensor):
-                                batch_data[k] = [x.to(config.device) for x in v]
-                        output = model(batch_data)
-                        dataset_name = dataset
-                        video_num = batch_data['video_name'][0]
-                    else:
-                        feature,gtscore,dataset_name,video_num = batch_data
-                        feature = feature.to(config.device)
-                        gtscore = gtscore.to(config.device)
-                        output = model(feature)
-
-                    if dataset_name in ['SumMe','TVSum']:
-                        with h5py.File(f'./data/eccv16_dataset_{dataset_name.lower()}_google_pool5.h5','r') as hdf:
-                            user_summary = np.array(hdf[video_num]['user_summary'])
-                            sb = np.array(hdf[f"{video_num}/change_points"])
-                            n_frames = np.array(hdf[f"{video_num}/n_frames"])
-                            positions = np.array(hdf[f"{video_num}/picks"])
-                        scores = output.squeeze().clone().detach().cpu().numpy().tolist()
-                        summary = generate_summary([sb], [scores], [n_frames], [positions])[0]
-                        if dataset_name=='SumMe':
-                            spear,kendall = get_corr_coeff([summary],[video_num],dataset_name,user_summary)
-                        elif dataset_name=='TVSum':
-                            spear,kendall = get_corr_coeff([scores],[video_num],dataset_name,user_scores)
-                        
-                        val_spears.append(spear)
-                        val_kendalls.append(kendall)
-
-            if np.mean(val_kendalls) > model_selection_kendall and np.mean(val_spears) > model_selection_spear:
-                model_selection_kendall = np.mean(val_kendalls)
-                model_selection_spear = np.mean(val_spears)
-                torch.save(model.state_dict(), './tmp/weight.pt')
-        shutil.move('./tmp/weight.pt', f'./weights/{dataset}/split{split_id+1}.pt')
