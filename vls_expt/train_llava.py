@@ -75,7 +75,7 @@ class AttnModel(nn.Module):
 class LSTMAttnModel(nn.Module):
     def __init__(self, config_size):
         super().__init__()
-        bottleneck_size = 384
+        bottleneck_size = 256
         self.hidden_dim = bottleneck_size * 2  # Bi-LSTM output is hidden_size
 
         # 1. Temporal modeling with Bi-LSTM
@@ -176,16 +176,16 @@ class LLaVAVLS_PL(pl.LightningModule):
                     input_ids=chunk_input_ids,
                     attention_mask=chunk_attention_masks,
                     images=chunk_video,
-                    image_sizes=[[item] * getattr(self.config, 'clip_length', 32) for item in video_sizes],
+                    image_sizes=[[item] * chunk_size for item in video_sizes],
                     modalities=['image'] * chunk_len,
                     dpo_forward=True
                 )
-            all_hidden_states.append(hidden_states[:, -1].float().cpu())
+
+            all_hidden_states.append(hidden_states.mean(1).float().cpu())
             del logits, hidden_states, chunk_video, chunk_input_ids, chunk_attention_masks
             torch.cuda.empty_cache()
 
         last_hidden_states = torch.cat(all_hidden_states, dim=0).to(self.device)
-        
         impt_scores = self.attn_model(last_hidden_states)
         return impt_scores
 
@@ -276,7 +276,7 @@ for dataset in tqdm(config.datasets,total=len(config.datasets),ncols=70,leave=Tr
 
     if config.model_name == 'LLaVAVLS':
         def create_llava_splits():
-            for i in range(1):
+            for i in range(5):
                 if dataset == 'SumMe':
                     DatasetCls = SumMeLLaMA_VideoDataset
                     TrainCollator = SumMeTrainCollator
@@ -338,7 +338,7 @@ for dataset in tqdm(config.datasets,total=len(config.datasets),ncols=70,leave=Tr
             trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=test_loader)
             
             # Save the trained model weights
-            save_path = f'./weights/{dataset}/split{split_id+1}_attn_model.pth'
+            save_path = f'./weights/{dataset}/split{split_id+1}_lstm_attn_model.pth'
             if checkpoint_callback.best_model_path:
                 print(f"Loading best checkpoint from {checkpoint_callback.best_model_path}")
                 checkpoint = torch.load(checkpoint_callback.best_model_path, map_location='cpu')

@@ -35,37 +35,10 @@ custom_system_instruction = (
     "3. Action and Dynamics"
 )
 
-class AttnModel(nn.Module):
-    def __init__(self, config_size):
-        super().__init__()
-        bottleneck_size = 512
-        
-        self.mlp_head = nn.Sequential(
-            nn.Linear(config_size, bottleneck_size),
-            nn.LayerNorm(bottleneck_size),
-            nn.ReLU(),
-            nn.Linear(bottleneck_size, bottleneck_size//2),
-            nn.ReLU(),
-            # 2. Final scoring layer
-            nn.Linear(bottleneck_size//2, 1),
-            nn.Sigmoid()
-        )
-        self._reset_parameters()
-        
-    def _reset_parameters(self):
-        for module in self.mlp_head.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0.0)
-
-    def forward(self, x):
-        return self.mlp_head(x)
-
 class LSTMAttnModel(nn.Module):
     def __init__(self, config_size):
         super().__init__()
-        bottleneck_size = 384
+        bottleneck_size = 256
         self.hidden_dim = bottleneck_size * 2  # Bi-LSTM output is hidden_size
 
         # 1. Temporal modeling with Bi-LSTM
@@ -149,7 +122,7 @@ def get_llava_output(config, llava_model, tokenizer, batch, device):
                 modalities=['image'] * chunk_len,
                 dpo_forward=True
             )
-        all_hidden_states.append(hidden_states[:, -1].float().cpu())
+        all_hidden_states.append(hidden_states.mean(1).float().cpu())
         del logits, hidden_states, chunk_video, chunk_input_ids, chunk_attention_masks
         torch.cuda.empty_cache()
 
@@ -182,7 +155,7 @@ def main():
 
         print(f"Processing {dataset}...")
 
-        for split_id in range(1):
+        for split_id in range(5):
             # Setup DataLoader
             if dataset == 'SumMe':
                 DatasetCls = SumMeLLaMA_VideoDataset
@@ -202,7 +175,7 @@ def main():
                 attn_model = AttnModel(llava_model.config.hidden_size)
             
             # Load weights
-            weight_path = f'./weights/{dataset}/split{split_id+1}_attn_model.pth'
+            weight_path = f'./weights/{dataset}/split{split_id+1}_lstm_attn_model.pth'
             if not os.path.exists(weight_path):
                 print(f"Weights not found: {weight_path}. Skipping split {split_id}.")
                 continue
