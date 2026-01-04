@@ -3,6 +3,7 @@ import numpy as np
 import shutil
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import warnings
 import os
 import pytorch_lightning as pl
@@ -26,6 +27,7 @@ from llava.model.builder import load_pretrained_model
 from llava.mm_utils import tokenizer_image_token, get_model_name_from_path
 from dataloader.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, TrainBatchCollator as SumMeTrainCollator, ValBatchCollator as SumMeValCollator
 from dataloader.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, TrainBatchCollator as TVSumTrainCollator, ValBatchCollator as TVSumValCollator
+from models.GoogleNet import CSTA_GoogleNet
 
 # Suppress warning regarding tensor creation from list of numpy arrays
 warnings.filterwarnings("ignore", message="Creating a tensor from a list of numpy.ndarrays is extremely slow")
@@ -76,11 +78,11 @@ class LSTMAttnModel(nn.Module):
     def __init__(self, config_size):
         super().__init__()
         bottleneck_size = 256
-        self.hidden_dim = bottleneck_size * 2  # Bi-LSTM output is hidden_size
+        self.hidden_dim = bottleneck_size * 2 # Bi-LSTM output is hidden_size
 
         # 1. Temporal modeling with Bi-LSTM
         self.lstm = nn.LSTM(
-            input_size=config_size, #+ 256,
+            input_size=config_size,
             hidden_size=bottleneck_size,
             num_layers=2,
             batch_first=True,
@@ -109,6 +111,46 @@ class LSTMAttnModel(nn.Module):
         x = x.squeeze(0)
         return self.mlp_head(x)
 
+class LLaVA_CSTA_Head(nn.Module):
+    def __init__(self, llava_dim=4096, csta_dim=1024):
+        super().__init__()
+        # 1. Adapter Layer: 4096 -> 1024
+        self.adapter = nn.Sequential(
+            nn.Linear(llava_dim, csta_dim),
+            nn.LayerNorm(csta_dim),
+            nn.ReLU()
+        )
+        
+        # 2. The CSTA Model (Your provided class)
+        # We configure it with the settings that worked best in the paper
+        self.csta = CSTA_GoogleNet(
+            model_name='GoogleNet_Attention',
+            Scale=None,                # Parser default
+            Softmax_axis='TD',         # Parser default
+            Balance=None,              # Parser default
+            Positional_encoding='FPE',
+            Positional_encoding_shape='TD',
+            Positional_encoding_way='PGL_SUM',
+            Dropout_on=True,
+            Dropout_ratio=0.6,         # Parser default
+            Classifier_on=True,
+            CLS_on=True,               # Parser default
+            CLS_mix='Final',
+            key_value_emb='kv',
+            Skip_connection='KC',      # Parser default
+            Layernorm=True,
+            dim=csta_dim
+        )
+
+    def forward(self, x):
+        x = self.adapter(x)
+        x = x.repeat(1, 3, 1, 1)                
+        
+        # 3. Pass to CSTA
+        scores = self.csta(x)
+        
+        return scores.unsqueeze(1)
+
 class LLaVAVLS_PL(pl.LightningModule):
     def __init__(self, config, llava_model, tokenizer, dataset_name):
         super().__init__()
@@ -116,6 +158,8 @@ class LLaVAVLS_PL(pl.LightningModule):
         self.llava_model = llava_model
         self.tokenizer = tokenizer
         self.dataset_name = dataset_name
+        self.yes_idx = 3869
+        self.no_idx = 1939
 
         # Freeze LLaVA model
         self.llava_model.eval()
@@ -123,8 +167,11 @@ class LLaVAVLS_PL(pl.LightningModule):
             param.requires_grad = False
 
         # Trainable video summarization model
-        if hasattr(self.config, 'output_name') and "lstm" in self.config.output_name:
-            self.attn_model = LSTMAttnModel(self.llava_model.config.hidden_size)
+        if self.config.output_name == 'csta':
+                self.attn_model = LLaVA_CSTA_Head(llava_dim=4096, csta_dim=1024)
+
+        elif hasattr(self.config, 'output_name') and "lstm" in self.config.output_name:
+            self.attn_model = LSTMAttnModel(self.llava_model.config.hidden_size + 2)
         else:
             self.attn_model = AttnModel(self.llava_model.config.hidden_size)
             
@@ -132,8 +179,12 @@ class LLaVAVLS_PL(pl.LightningModule):
         self.validation_step_outputs = []
 
     def forward(self, batch):
-        question = getattr(self.config, 'prompt', "Please summarize the video.")
-        if question is None: question = "Please summarize the video."
+        #question = "Does this frame capture a key highlight or important event? Answer Yes or No."
+        question = (
+            "In the context of creating a concise video summary, "
+            "does this frame capture a key highlight or important event? "
+            "Answer Yes or No."
+        )
         video = batch['video'].half()
         video_sizes = batch['video_sizes'][0]
 
@@ -180,8 +231,15 @@ class LLaVAVLS_PL(pl.LightningModule):
                     modalities=['image'] * chunk_len,
                     dpo_forward=True
                 )
+            probs = F.softmax(logits, dim=-1)
+            yes_probs = probs[:, -1, self.yes_idx]
+            no_probs = probs[:, -1, self.no_idx]
 
-            all_hidden_states.append(hidden_states.mean(1).float().cpu())
+            impt_probs = torch.stack([yes_probs, no_probs], dim=1)
+            #import pdb; pdb.set_trace()
+            #all_hidden_states.append(hidden_states[:, -1].float().cpu())
+            combined = torch.cat([hidden_states[:, -1], impt_probs], dim=1)
+            all_hidden_states.append(combined.float().cpu())
             del logits, hidden_states, chunk_video, chunk_input_ids, chunk_attention_masks
             torch.cuda.empty_cache()
 
@@ -247,7 +305,7 @@ class LLaVAVLS_PL(pl.LightningModule):
         self.validation_step_outputs.clear()
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=float(self.config.learning_rate), weight_decay=float(self.config.weight_decay))
+        return torch.optim.Adam(self.parameters(), lr=1e-3, weight_decay=float(self.config.weight_decay))
 
 # Start training
 llava_model = None
@@ -322,7 +380,7 @@ for dataset in tqdm(config.datasets,total=len(config.datasets),ncols=70,leave=Tr
             )
             
             trainer = pl.Trainer(
-                max_epochs=config.epochs,
+                max_epochs=50,
                 accelerator='gpu',
                 devices='auto',
                 strategy='ddp',
@@ -338,7 +396,7 @@ for dataset in tqdm(config.datasets,total=len(config.datasets),ncols=70,leave=Tr
             trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=test_loader)
             
             # Save the trained model weights
-            save_path = f'./weights/{dataset}/split{split_id+1}_lstm_attn_model.pth'
+            save_path = f'./weights/{dataset}/split{split_id+1}_lstm_projector_attn_model.pth'
             if checkpoint_callback.best_model_path:
                 print(f"Loading best checkpoint from {checkpoint_callback.best_model_path}")
                 checkpoint = torch.load(checkpoint_callback.best_model_path, map_location='cpu')

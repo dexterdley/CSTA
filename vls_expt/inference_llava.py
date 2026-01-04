@@ -2,6 +2,7 @@ import h5py
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import warnings
 import os
 from tqdm import tqdm
@@ -18,6 +19,7 @@ from llava.model.builder import load_pretrained_model
 from llava.mm_utils import tokenizer_image_token, get_model_name_from_path
 from dataloader.llava_summe_video_dataset import SumMeLLaMA_VideoDataset, ValBatchCollator as SumMeValCollator
 from dataloader.llava_tvsum_video_dataset import TVSumLLaMA_VideoDataset, ValBatchCollator as TVSumValCollator
+from models.GoogleNet import CSTA_GoogleNet
 
 # Suppress warning regarding tensor creation from list of numpy arrays
 warnings.filterwarnings("ignore", message="Creating a tensor from a list of numpy.ndarrays is extremely slow")
@@ -38,12 +40,12 @@ custom_system_instruction = (
 class LSTMAttnModel(nn.Module):
     def __init__(self, config_size):
         super().__init__()
-        bottleneck_size = 256
-        self.hidden_dim = bottleneck_size * 2  # Bi-LSTM output is hidden_size
+        bottleneck_size = 32
+        self.hidden_dim = bottleneck_size * 2 # Bi-LSTM output is hidden_size
 
         # 1. Temporal modeling with Bi-LSTM
         self.lstm = nn.LSTM(
-            input_size=config_size, #+ 256,
+            input_size=config_size,
             hidden_size=bottleneck_size,
             num_layers=2,
             batch_first=True,
@@ -72,10 +74,55 @@ class LSTMAttnModel(nn.Module):
         x = x.squeeze(0)
         return self.mlp_head(x)
 
+
+class LLaVA_CSTA_Head(nn.Module):
+    def __init__(self, llava_dim=4096, csta_dim=1024):
+        super().__init__()
+        # 1. Adapter Layer: 4096 -> 1024
+        self.adapter = nn.Sequential(
+            nn.Linear(llava_dim, csta_dim),
+            nn.LayerNorm(csta_dim),
+            nn.ReLU()
+        )
+        
+        # 2. The CSTA Model (Your provided class)
+        # We configure it with the settings that worked best in the paper
+        self.csta = CSTA_GoogleNet(
+            model_name='GoogleNet_Attention',
+            Scale=None,                # Parser default
+            Softmax_axis='TD',         # Parser default
+            Balance=None,              # Parser default
+            Positional_encoding='FPE',
+            Positional_encoding_shape='TD',
+            Positional_encoding_way='PGL_SUM',
+            Dropout_on=True,
+            Dropout_ratio=0.6,         # Parser default
+            Classifier_on=True,
+            CLS_on=True,               # Parser default
+            CLS_mix='Final',
+            key_value_emb='kv',
+            Skip_connection='KC',      # Parser default
+            Layernorm=True,
+            dim=csta_dim
+        )
+
+    def forward(self, x):
+        x = self.adapter(x)
+        x = x.repeat(1, 3, 1, 1)                
+        
+        # 3. Pass to CSTA
+        scores = self.csta(x)
+        
+        return scores.unsqueeze(1)
+
 def get_llava_output(config, llava_model, tokenizer, batch, device):
-    question = getattr(config, 'prompt', "Please summarize the video.")
-    if question is None: question = "Please summarize the video."
-    
+    #question = "Does this frame capture a key highlight or important event? Answer Yes or No."
+    question = (
+            "In the context of creating a concise video summary, "
+            "does this frame capture a key highlight or important event? "
+            "Answer Yes or No."
+    )
+
     # Ensure video is on the correct device and dtype
     video = batch['video'].half().to(device)
     video_sizes = batch['video_sizes'][0]
@@ -122,7 +169,14 @@ def get_llava_output(config, llava_model, tokenizer, batch, device):
                 modalities=['image'] * chunk_len,
                 dpo_forward=True
             )
-        all_hidden_states.append(hidden_states.mean(1).float().cpu())
+        probs = F.softmax(logits, dim=-1)
+        yes_probs = probs[:, -1, 3869]
+        no_probs = probs[:, -1, 1939]
+
+        #all_hidden_states.append(hidden_states[:, -1].float().cpu())
+        impt_probs = torch.stack([yes_probs, no_probs], dim=1)
+        combined = torch.cat([hidden_states[:, -1], impt_probs], dim=1)
+        all_hidden_states.append(combined.float().cpu())
         del logits, hidden_states, chunk_video, chunk_input_ids, chunk_attention_masks
         torch.cuda.empty_cache()
 
@@ -169,13 +223,17 @@ def main():
             test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=4, collate_fn=ValCollator(mode="val"), pin_memory=True)
 
             # Setup Attn Model
-            if hasattr(config, 'output_name') and "lstm" in config.output_name:
-                attn_model = LSTMAttnModel(llava_model.config.hidden_size)
+            if hasattr(config, 'output_name') and "csta" in config.output_name:
+                attn_model = LLaVA_CSTA_Head(llava_dim=4096, csta_dim=1024)
+
+            elif hasattr(config, 'output_name') and "lstm" in config.output_name:
+                attn_model = LSTMAttnModel(llava_model.config.hidden_size + 2)
             else:
                 attn_model = AttnModel(llava_model.config.hidden_size)
             
+            '''
             # Load weights
-            weight_path = f'./weights/{dataset}/split{split_id+1}_lstm_attn_model.pth'
+            weight_path = f'./weights/{dataset}/split{split_id+1}_lstm_projector_attn_model.pth'
             if not os.path.exists(weight_path):
                 print(f"Weights not found: {weight_path}. Skipping split {split_id}.")
                 continue
@@ -184,17 +242,18 @@ def main():
             attn_model.load_state_dict(torch.load(weight_path, map_location='cpu'))
             attn_model.to(device)
             attn_model.eval()
-
+            '''
             kendalls = []
             spears = []
 
             with torch.no_grad():
                 for batch in tqdm(test_loader, desc=f"Split {split_id}", leave=False):
                     # Get features from LLaVA
-                    hidden_states = get_llava_output(config, llava_model, tokenizer, batch, device)
+                    #hidden_states = get_llava_output(config, llava_model, tokenizer, batch, device)
                     
                     # Get scores from AttnModel
-                    output = attn_model(hidden_states)
+                    #output = attn_model(hidden_states)
+                    output = get_llava_output(config, llava_model, tokenizer, batch, device)
                     
                     video_num = batch['video_name'][0]
                     
